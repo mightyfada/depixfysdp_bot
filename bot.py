@@ -1,4 +1,5 @@
 import logging
+import os
 import aiohttp
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
 from telegram.ext import (
@@ -16,10 +17,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ======================================================
-# COLE SEU TOKEN DO BOT AQUI
-BOT_TOKEN = "8739383957:AAHrgxE_6rhf7R3IZIcBfoyQVarghk0fxrI"
-# ======================================================
+BOT_TOKEN = os.environ["BOT_TOKEN"]
 
 GARDEN_URL = "https://chainaid.app/inurl/"
 
@@ -33,52 +31,34 @@ PIX_TO_DEPIX_RATE = 1.0  # 1 Pix = 1 DePix
 FEE_PERCENT = 0.001  # 0.1%
 FEE_MIN = 1  # mínimo 1 unidade
 
-# DePix é atrelado 1:1 ao Real Brasileiro (BRL)
-# Usando taxa aproximada fixa, pois DePix não tem API direta
-DEPIX_TO_USD_RATE = 0.17  # 1 BRL ≈ $0.17 USD (atualizar conforme necessário)
-
 
 # ─── Funções da API ──────────────────────────────────────────────────────────
 
-async def get_btc_price_usd() -> float:
+async def get_btc_and_brl_rates() -> tuple[float, float]:
     """
-    Busca o preço atual do Bitcoin em USD da API CoinGecko.
-    Não é necessário chave de API para endpoints públicos.
-    Docs: https://www.coingecko.com/en/api
+    Busca o preço atual do BTC em USD e a taxa BRL/USD da CoinGecko.
+    Retorna (btc_price_usd, depix_to_usd_rate)
     """
     url = "https://api.coingecko.com/api/v3/simple/price"
     params = {
-        "ids": "bitcoin",
+        "ids": "bitcoin,brazilian-real",
         "vs_currencies": "usd",
     }
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(url, params=params, timeout=10) as response:
+            async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=10)) as response:
                 if response.status == 200:
                     data = await response.json()
-                    btc_price = data["bitcoin"]["usd"]
-                    logger.info(f"Preço do BTC obtido: ${btc_price}")
-                    return float(btc_price)
+                    btc_price = float(data["bitcoin"]["usd"])
+                    brl_rate = float(data["brazilian-real"]["usd"])
+                    logger.info(f"BTC: ${btc_price} | BRL/USD: {brl_rate}")
+                    return btc_price, brl_rate
                 else:
-                    logger.warning(f"API CoinGecko retornou status {response.status}")
-                    # Fallback: usar último preço conhecido do BTC
-                    return 77686.0
+                    logger.warning(f"CoinGecko status {response.status}, usando fallback")
+                    return 77686.0, 0.17
     except Exception as e:
-        logger.error(f"Erro ao buscar preço do BTC: {e}")
-        # Preço de fallback caso a API falhe
-        return 77686.0
-
-
-def calculate_depix_to_lbtc_rate(btc_price_usd: float) -> float:
-    """
-    Calcula a taxa DePix para L-BTC.
-    L-BTC é atrelado 1:1 ao BTC na Rede Liquid.
-    DePix é atrelado 1:1 ao BRL (~$0.17 USD).
-    """
-    if btc_price_usd <= 0:
-        return 0.000002188  # taxa de fallback
-    rate = DEPIX_TO_USD_RATE / btc_price_usd
-    return rate
+        logger.error(f"Erro ao buscar taxas: {e}")
+        return 77686.0, 0.17
 
 
 # ─── Teclados ────────────────────────────────────────────────────────────────
@@ -202,7 +182,7 @@ async def enter_amount(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         )
         return ENTER_AMOUNT
 
-    # --- Buscar preço do BTC em tempo real e calcular taxa ---
+    # --- Calcular taxa e montar resumo ---
     if action == "bridge":
         from_unit = "Pix"
         to_unit = "DePix"
@@ -210,19 +190,21 @@ async def enter_amount(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         rate_str = "1 Pix ≈ 1 DePix"
         action_label = "Bridge"
         est_time = "~15 min"
+        you_receive = round(amount_after_fee * rate, 8)
     else:
         from_unit = "DePix"
         to_unit = "L-BTC"
-        
-        # Buscar preço do BTC em tempo real da CoinGecko
-        btc_price_usd = await get_btc_price_usd()
-        rate = calculate_depix_to_lbtc_rate(btc_price_usd)
-        
-        rate_str = f"1 DePix ≈ {rate:.8f} L-BTC (BTC @ ${btc_price_usd:,.2f})"
+
+        btc_price_usd, depix_to_usd_rate = await get_btc_and_brl_rates()
+        rate = depix_to_usd_rate / btc_price_usd
+        you_receive = round(amount_after_fee * rate, 8)
+
+        rate_str = (
+            f"1 DePix ≈ {rate:.8f} L-BTC "
+            f"(BTC @ ${btc_price_usd:,.2f} | BRL/USD: {depix_to_usd_rate:.4f})"
+        )
         action_label = "Exchange"
         est_time = "~32 min"
-
-    you_receive = round(amount_after_fee * rate, 8)
 
     context.user_data.update({
         "amount": amount,
